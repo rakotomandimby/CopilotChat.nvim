@@ -85,6 +85,266 @@ local function get_cached(cache, key, filler)
   return value
 end
 
+---@param key any
+---@return boolean
+local function is_sensitive_key(key)
+  if type(key) ~= 'string' then
+    return false
+  end
+
+  key = key:lower()
+  return key:find('authorization', 1, true) ~= nil
+    or key:find('token', 1, true) ~= nil
+    or key:find('secret', 1, true) ~= nil
+    or key:find('password', 1, true) ~= nil
+    or key:find('cookie', 1, true) ~= nil
+end
+
+---@param value any
+---@return any
+local function sanitize_for_log(value)
+  if type(value) ~= 'table' then
+    return value
+  end
+
+  local out = {}
+  for k, v in pairs(value) do
+    if is_sensitive_key(k) then
+      out[k] = '<redacted>'
+    else
+      out[k] = type(v) == 'table' and sanitize_for_log(v) or v
+    end
+  end
+
+  return out
+end
+
+---@param text any
+---@param max_len integer?
+---@return any
+local function preview_text(text, max_len)
+  if type(text) ~= 'string' then
+    return text
+  end
+
+  max_len = max_len or 200
+  local normalized = text:gsub('\r', '\\r'):gsub('\n', '\\n')
+  if #normalized > max_len then
+    return normalized:sub(1, max_len) .. '…'
+  end
+  return normalized
+end
+
+---@param models table<string, CopilotChat.client.Model>
+---@return table<string, table>
+local function summarize_models(models)
+  local out = {}
+  local ids = vim.tbl_keys(models or {})
+  table.sort(ids)
+
+  for _, id in ipairs(ids) do
+    local model = models[id]
+    out[id] = {
+      id = model.id,
+      name = model.name,
+      provider = model.provider,
+      tokenizer = model.tokenizer,
+      max_input_tokens = model.max_input_tokens,
+      max_output_tokens = model.max_output_tokens,
+      streaming = model.streaming,
+      tools = model.tools,
+      reasoning = model.reasoning,
+      version = model.version,
+      use_responses = model.use_responses,
+      base_url = model.base_url,
+    }
+  end
+
+  return out
+end
+
+---@param models table<string, CopilotChat.client.Model>
+---@param provider_name string
+---@return string[]
+local function model_ids_for_provider(models, provider_name)
+  local out = {}
+  for id, model in pairs(models or {}) do
+    if model.provider == provider_name then
+      table.insert(out, id)
+    end
+  end
+  table.sort(out)
+  return out
+end
+
+---@param cache table?
+---@return table?
+local function summarize_provider_cache(cache)
+  if not cache then
+    return nil
+  end
+
+  local now = math.floor(os.time())
+  local out = {}
+
+  for key, value in pairs(cache) do
+    if not tostring(key):match('_expires_at$') then
+      local expires_at = cache[key .. '_expires_at']
+      out[key] = {
+        present = value ~= nil,
+        expires_at = expires_at,
+        expired = expires_at and expires_at <= now or nil,
+      }
+
+      if type(value) == 'table' then
+        if key == 'headers' then
+          out[key].value = sanitize_for_log(value)
+        elseif vim.islist(value) then
+          out[key].count = #value
+          if key == 'models' then
+            out[key].value = vim.tbl_map(function(model)
+              return {
+                id = model.id,
+                name = model.name,
+                provider = model.provider,
+                version = model.version,
+                use_responses = model.use_responses,
+                base_url = model.base_url,
+              }
+            end, value)
+          else
+            out[key].value = sanitize_for_log(value)
+          end
+        else
+          out[key].value = sanitize_for_log(value)
+        end
+      else
+        out[key].value = value
+      end
+    end
+  end
+
+  return out
+end
+
+---@param tools table<CopilotChat.client.Tool>?
+---@return table
+local function summarize_tools(tools)
+  return vim.tbl_map(function(tool)
+    local properties = {}
+    if tool.schema and tool.schema.properties then
+      properties = vim.tbl_keys(tool.schema.properties)
+      table.sort(properties)
+    end
+
+    return {
+      name = tool.name,
+      description = preview_text(tool.description, 120),
+      schema_properties = properties,
+    }
+  end, tools or {})
+end
+
+---@param resources table<CopilotChat.client.Resource>?
+---@return table
+local function summarize_resources(resources)
+  return vim.tbl_map(function(resource)
+    return {
+      uri = resource.uri,
+      name = resource.name,
+      mimetype = resource.mimetype,
+      data_length = resource.data and #resource.data or 0,
+      data_preview = preview_text(resource.data, 160),
+      annotations = resource.annotations,
+    }
+  end, resources or {})
+end
+
+---@param messages table<CopilotChat.client.Message>
+---@return table
+local function summarize_messages(messages)
+  return vim.tbl_map(function(message)
+    local out = {
+      role = message.role,
+      content_length = message.content and #message.content or 0,
+      content_preview = preview_text(message.content, 160),
+      reasoning_length = message.reasoning and #message.reasoning or 0,
+      tool_call_id = message.tool_call_id,
+      model = message.model,
+    }
+
+    if message.tool_calls then
+      out.tool_calls = vim.tbl_map(function(tool_call)
+        return {
+          id = tool_call.id,
+          index = tool_call.index,
+          name = tool_call.name,
+          arguments_length = tool_call.arguments and #tool_call.arguments or 0,
+          arguments_preview = preview_text(tool_call.arguments, 160),
+        }
+      end, message.tool_calls)
+    end
+
+    return out
+  end, messages or {})
+end
+
+---@param request table
+---@return table
+local function summarize_request(request)
+  local summary = {
+    model = request.model,
+    stream = request.stream,
+    messages_count = request.messages and #request.messages or nil,
+    input_count = request.input and #request.input or nil,
+    tools_count = request.tools and #request.tools or 0,
+    instructions_length = request.instructions and #request.instructions or 0,
+  }
+
+  local ok, inspected = pcall(vim.inspect, sanitize_for_log(request), { indent = '  ' })
+  summary.preview = ok and preview_text(inspected, 2000) or '<inspect failed>'
+  return summary
+end
+
+---@param trace table
+---@param event string
+---@param data any
+local function add_trace(trace, event, data)
+  local entry = {
+    at = os.date('!%Y-%m-%dT%H:%M:%SZ'),
+    event = event,
+    data = sanitize_for_log(data),
+  }
+  table.insert(trace, entry)
+
+  local ok, inspected = pcall(vim.inspect, entry, { indent = '  ' })
+  if ok then
+    log.debug('CopilotChat ask trace:\n' .. inspected)
+  else
+    log.debug('CopilotChat ask trace event: ' .. event)
+  end
+end
+
+---@param job_id string
+---@param trace table
+---@param reason string
+---@param extra any
+local function dump_trace(job_id, trace, reason, extra)
+  local payload = {
+    job_id = job_id,
+    reason = reason,
+    extra = sanitize_for_log(extra),
+    trace = trace,
+  }
+
+  local ok, inspected = pcall(vim.inspect, payload, { indent = '  ' })
+  if ok then
+    log.error('CopilotChat ask trace dump:\n' .. inspected)
+  else
+    log.error('CopilotChat ask trace dump failed for job ' .. job_id .. ': ' .. reason)
+  end
+end
+
 --- Generate resource block with line numbers, truncating if necessary
 ---@param content string
 ---@param start_line number: The starting line number
@@ -298,34 +558,125 @@ end
 function Client:ask(opts)
   opts = opts or {}
   local job_id = utils.uuid()
+  local trace = {}
+
+  local function fail(message, extra)
+    add_trace(trace, 'error', {
+      message = message,
+      extra = extra,
+    })
+    dump_trace(job_id, trace, message, extra)
+    error(message)
+  end
+
+  add_trace(trace, 'ask_started', {
+    job_id = job_id,
+    opts = {
+      headless = opts.headless,
+      model = opts.model,
+      temperature = opts.temperature,
+      system_prompt_length = opts.system_prompt and #opts.system_prompt or 0,
+      tools = summarize_tools(opts.tools),
+      resources = summarize_resources(opts.resources),
+      history = summarize_messages(opts.history),
+    },
+  })
 
   log.debug('Model:', opts.model)
-  log.debug('Tools:', #opts.tools)
-  log.debug('Resources:', #opts.resources)
-  log.debug('History:', #opts.history)
+  log.debug('Tools:', #(opts.tools or {}))
+  log.debug('Resources:', #(opts.resources or {}))
+  log.debug('History:', #(opts.history or {}))
 
   local models = self:models()
+  add_trace(trace, 'models_loaded', {
+    requested_model = opts.model,
+    available_model_ids = vim.tbl_keys(models),
+    models = summarize_models(models),
+  })
+
   local model_config = models[opts.model]
   if not model_config then
-    error('Model not found: ' .. opts.model)
+    fail('Model not found: ' .. tostring(opts.model), {
+      requested_model = opts.model,
+      available_models = summarize_models(models),
+    })
   end
 
   local provider_name = model_config.provider
   if not provider_name then
-    error('Provider not found for model: ' .. opts.model)
+    fail('Provider not found for model: ' .. tostring(opts.model), {
+      requested_model = opts.model,
+      model_config = model_config,
+    })
   end
+
+  add_trace(trace, 'model_selected', {
+    requested_model = opts.model,
+    provider_name = provider_name,
+    model_config = model_config,
+  })
+
   local provider = self:get_providers():get(provider_name)
   if not provider then
-    error('Provider not found: ' .. provider_name)
+    fail('Provider not found: ' .. provider_name, {
+      requested_model = opts.model,
+      provider_name = provider_name,
+      available_providers = self:get_providers():keys(),
+    })
   end
 
   if provider.resolve_model then
-    local headers = self:authenticate(provider_name)
-    local resolved_model = provider.resolve_model(headers, opts.model)
+    add_trace(trace, 'resolve_model_started', {
+      provider_name = provider_name,
+      requested_model = opts.model,
+      provider_cache = summarize_provider_cache(self.provider_cache[provider_name]),
+    })
+
+    local ok_headers, headers = pcall(self.authenticate, self, provider_name)
+    if not ok_headers then
+      fail('Failed to authenticate provider: ' .. provider_name, {
+        provider_name = provider_name,
+        authenticate_error = headers,
+        provider_cache = summarize_provider_cache(self.provider_cache[provider_name]),
+      })
+    end
+
+    add_trace(trace, 'provider_authenticated', {
+      provider_name = provider_name,
+      headers = headers,
+      provider_cache = summarize_provider_cache(self.provider_cache[provider_name]),
+    })
+
+    local requested_model = opts.model
+    local ok_resolve, resolved_model = pcall(provider.resolve_model, headers, opts.model)
+    if not ok_resolve then
+      fail('Failed to resolve model: ' .. tostring(requested_model), {
+        provider_name = provider_name,
+        requested_model = requested_model,
+        resolve_error = resolved_model,
+        provider_cache = summarize_provider_cache(self.provider_cache[provider_name]),
+      })
+    end
+
     opts.model = resolved_model
+    add_trace(trace, 'resolve_model_finished', {
+      provider_name = provider_name,
+      requested_model = requested_model,
+      resolved_model = resolved_model,
+      same_provider_model_ids = model_ids_for_provider(models, provider_name),
+      provider_cache = summarize_provider_cache(self.provider_cache[provider_name]),
+    })
+
     model_config = models[opts.model]
     if not model_config then
-      error('Resolved model not found: ' .. opts.model)
+      fail('Resolved model not found: ' .. tostring(opts.model), {
+        provider_name = provider_name,
+        requested_model = requested_model,
+        resolved_model = resolved_model,
+        same_provider_model_ids = model_ids_for_provider(models, provider_name),
+        available_models = summarize_models(models),
+        provider_cache = summarize_provider_cache(self.provider_cache[provider_name]),
+      })
     end
   end
 
@@ -337,12 +688,36 @@ function Client:ask(opts)
     tools = opts.tools,
   }
 
+  add_trace(trace, 'request_options_prepared', {
+    provider_name = provider_name,
+    resolved_model = opts.model,
+    options = sanitize_for_log(options),
+  })
+
   local max_tokens = model_config.max_input_tokens
   local tokenizer = model_config.tokenizer or 'o200k_base'
   log.debug('Tokenizer:', tokenizer)
 
   if max_tokens and tokenizer then
-    tiktoken:load(tokenizer)
+    add_trace(trace, 'tokenizer_loading_started', {
+      tokenizer = tokenizer,
+      max_tokens = max_tokens,
+    })
+
+    local ok_load, load_err = pcall(tiktoken.load, tiktoken, tokenizer)
+    if not ok_load then
+      fail('Failed to load tokenizer: ' .. tostring(tokenizer), {
+        tokenizer = tokenizer,
+        error = load_err,
+        provider_name = provider_name,
+        resolved_model = opts.model,
+      })
+    end
+
+    add_trace(trace, 'tokenizer_loading_finished', {
+      tokenizer = tokenizer,
+      max_tokens = max_tokens,
+    })
   end
 
   if not opts.headless then
@@ -353,6 +728,10 @@ function Client:ask(opts)
   local tool_calls = orderedmap()
   local generated_messages = {}
   local resource_messages = generate_resource_messages(opts.resources)
+
+  add_trace(trace, 'resource_messages_generated', {
+    resource_messages = summarize_messages(resource_messages),
+  })
 
   if max_tokens then
     -- Count required tokens that we cannot reduce
@@ -372,28 +751,73 @@ function Client:ask(opts)
       history_tokens = history_tokens + tiktoken:count(msg.content)
     end
 
+    add_trace(trace, 'token_budget_computed', {
+      max_tokens = max_tokens,
+      tokenizer = tokenizer,
+      system_tokens = system_tokens,
+      prompt_tokens = prompt_tokens,
+      resource_tokens = resource_tokens,
+      required_tokens = required_tokens,
+      history_limit = history_limit,
+      history_tokens_before_trim = history_tokens,
+    })
+
     -- Remove history messages except prompt until we are under the limit
+    local removed_history = {}
     while history_tokens > history_limit and #history > 1 do
       local entry = table.remove(history, 1)
       history_tokens = history_tokens - tiktoken:count(entry.content)
+      table.insert(removed_history, {
+        role = entry.role,
+        content_length = entry.content and #entry.content or 0,
+        content_preview = preview_text(entry.content, 120),
+      })
     end
 
     -- Now add as many files as possible with remaining token budget
     local remaining_tokens = max_tokens - required_tokens - history_tokens
+    local included_resources = {}
+    local skipped_resources = {}
     for _, message in ipairs(resource_messages) do
       local tokens = tiktoken:count(message.content)
       if remaining_tokens - tokens >= 0 then
         remaining_tokens = remaining_tokens - tokens
         table.insert(generated_messages, message)
+        table.insert(included_resources, {
+          content_length = #message.content,
+          tokens = tokens,
+          preview = preview_text(message.content, 120),
+        })
       else
+        table.insert(skipped_resources, {
+          content_length = #message.content,
+          tokens = tokens,
+          preview = preview_text(message.content, 120),
+        })
         break
       end
     end
+
+    add_trace(trace, 'token_budget_applied', {
+      history_tokens_after_trim = history_tokens,
+      removed_history = removed_history,
+      remaining_tokens = remaining_tokens,
+      included_resources = included_resources,
+      skipped_resources = skipped_resources,
+      final_history = summarize_messages(history),
+      generated_messages = summarize_messages(generated_messages),
+    })
   else
     -- Add all embedding messages as we cant limit them
     for _, message in ipairs(resource_messages) do
       table.insert(generated_messages, message)
     end
+
+    add_trace(trace, 'token_budget_skipped', {
+      reason = 'model_has_no_max_input_tokens',
+      final_history = summarize_messages(history),
+      generated_messages = summarize_messages(generated_messages),
+    })
   end
 
   local errored = nil
@@ -407,6 +831,12 @@ function Client:ask(opts)
     if err then
       errored = err
     end
+
+    add_trace(trace, 'stream_finished', {
+      error = err,
+      current_job = self.current_job,
+      finished = true,
+    })
 
     log.debug('Finishing stream', err)
     finished = true
@@ -428,16 +858,31 @@ function Client:ask(opts)
     local content, err = utils.json_decode(line)
 
     if err then
+      add_trace(trace, 'stream_json_decode_failed', {
+        line_preview = preview_text(line, 500),
+        error = err,
+      })
       finish_stream(line, job)
       return
     end
 
     if type(content) ~= 'table' then
+      add_trace(trace, 'stream_non_table_payload', {
+        payload = content,
+      })
       finish_stream(content, job)
       return
     end
 
     local out = provider.prepare_output(content, options)
+    add_trace(trace, 'provider_output_received', {
+      finish_reason = out.finish_reason,
+      total_tokens = out.total_tokens,
+      model = out.model,
+      content_preview = preview_text(out.content, 160),
+      reasoning_preview = preview_text(out.reasoning, 160),
+      tool_calls = out.tool_calls,
+    })
 
     if out.total_tokens then
       token_count = out.total_tokens
@@ -506,6 +951,7 @@ function Client:ask(opts)
 
     line = line:gsub('^data:%s*', '')
     if line == '[DONE]' then
+      add_trace(trace, 'stream_done_marker_received', {})
       finish_stream(nil, job)
       return
     end
@@ -519,11 +965,19 @@ function Client:ask(opts)
     end
 
     if not opts.headless and self.current_job ~= job_id then
+      add_trace(trace, 'stream_stopped_due_to_job_switch', {
+        current_job = self.current_job,
+        expected_job = job_id,
+      })
       finish_stream(nil, job)
       return
     end
 
     if err then
+      add_trace(trace, 'stream_callback_error', {
+        error = err,
+        line_preview = preview_text(line, 500),
+      })
       finish_stream(err and err or line, job)
       return
     end
@@ -536,14 +990,48 @@ function Client:ask(opts)
     self.current_job = job_id
   end
 
-  local headers = self:authenticate(provider_name)
+  local ok_headers, headers = pcall(self.authenticate, self, provider_name)
+  if not ok_headers then
+    fail('Failed to authenticate provider: ' .. provider_name, {
+      provider_name = provider_name,
+      authenticate_error = headers,
+      provider_cache = summarize_provider_cache(self.provider_cache[provider_name]),
+    })
+  end
 
-  local request, extra_headers =
-    provider.prepare_input(generate_ask_request(opts.system_prompt, history, generated_messages), options)
+  add_trace(trace, 'request_auth_headers_ready', {
+    provider_name = provider_name,
+    headers = headers,
+    provider_cache = summarize_provider_cache(self.provider_cache[provider_name]),
+  })
+
+  local request_messages = generate_ask_request(opts.system_prompt, history, generated_messages)
+  add_trace(trace, 'request_messages_ready', {
+    messages = summarize_messages(request_messages),
+  })
+
+  local ok_prepare, request, extra_headers = pcall(provider.prepare_input, request_messages, options)
+  if not ok_prepare then
+    fail('Failed to prepare request for provider: ' .. provider_name, {
+      provider_name = provider_name,
+      error = request,
+      resolved_model = opts.model,
+      options = options,
+      request_messages = summarize_messages(request_messages),
+    })
+  end
 
   if extra_headers then
     headers = vim.tbl_extend('force', headers, extra_headers)
   end
+
+  add_trace(trace, 'request_prepared', {
+    provider_name = provider_name,
+    resolved_model = opts.model,
+    extra_headers = extra_headers,
+    final_headers = headers,
+    request = summarize_request(request),
+  })
 
   local is_stream = request.stream
 
@@ -556,10 +1044,36 @@ function Client:ask(opts)
     args.stream = stream_func
   end
 
-  local response, err = curl.post(provider.get_url(options), args)
+  local ok_url, url_or_err = pcall(provider.get_url, options)
+  if not ok_url then
+    fail('Failed to get provider url: ' .. provider_name, {
+      provider_name = provider_name,
+      error = url_or_err,
+      resolved_model = opts.model,
+      options = options,
+    })
+  end
+
+  add_trace(trace, 'request_dispatching', {
+    provider_name = provider_name,
+    url = url_or_err,
+    is_stream = is_stream,
+    args = {
+      json_request = args.json_request,
+      headers = args.headers,
+      body = summarize_request(args.body),
+      has_stream_callback = args.stream ~= nil,
+    },
+  })
+
+  local response, err = curl.post(url_or_err, args)
 
   if not opts.headless then
     if self.current_job ~= job_id then
+      add_trace(trace, 'request_aborted_due_to_job_switch', {
+        current_job = self.current_job,
+        expected_job = job_id,
+      })
       return
     end
 
@@ -583,19 +1097,38 @@ function Client:ask(opts)
       end
     end
 
-    error(error_msg)
+    fail(error_msg, {
+      provider_name = provider_name,
+      url = url_or_err,
+      response = response and sanitize_for_log(response) or nil,
+      err = err,
+    })
   end
 
   if errored then
-    error(errored)
+    fail(tostring(errored), {
+      provider_name = provider_name,
+      url = url_or_err,
+      partial_response = response and sanitize_for_log(response) or nil,
+    })
   end
 
   local response_text = response_content_buffer:tostring()
   local response_reasoning = response_reasoning_buffer:tostring()
 
   if response then
+    add_trace(trace, 'response_received', {
+      status = response.status,
+      body_preview = preview_text(response.body, 1000),
+      is_stream = is_stream,
+    })
+
     if is_stream then
       if utils.empty(response_text) and not finished then
+        add_trace(trace, 'stream_fallback_body_parse_started', {
+          body_preview = preview_text(response.body, 1000),
+        })
+
         for _, line in ipairs(vim.split(response.body, '\n')) do
           parse_stream_line(line)
         end
@@ -611,6 +1144,19 @@ function Client:ask(opts)
   local final_tool_calls = vim.tbl_filter(function(tc)
     return tc.name ~= nil
   end, tool_calls:values())
+
+  add_trace(trace, 'ask_finished', {
+    provider_name = provider_name,
+    resolved_model = opts.model,
+    response_content_length = #response_text,
+    response_content_preview = preview_text(response_text, 300),
+    response_reasoning_length = #response_reasoning,
+    response_reasoning_preview = preview_text(response_reasoning, 300),
+    token_count = token_count,
+    token_max_count = max_tokens,
+    output_model = out_model,
+    final_tool_calls = final_tool_calls,
+  })
 
   return {
     message = {
