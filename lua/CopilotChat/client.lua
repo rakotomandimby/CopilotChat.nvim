@@ -1068,6 +1068,11 @@ function Client:ask(opts)
 
   local response, err = curl.post(url_or_err, args)
 
+  if response then
+    log.debug('API response status:', response.status)
+    log.debug('API response body:\n' .. (response.body or '<empty>'))
+  end
+
   if not opts.headless then
     if self.current_job ~= job_id then
       add_trace(trace, 'request_aborted_due_to_job_switch', {
