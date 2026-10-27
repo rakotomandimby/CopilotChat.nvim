@@ -120,6 +120,7 @@ EOF
 
 The model picker shows AI Credit rates as `input/output` per million tokens. A `?` means the rate is unavailable.
 These are default-tier rates; cached-token and long-context pricing may differ. Auto has no fixed model rate.
+Auto is listed first. Other models are ordered by output rate, lowest first, with unavailable rates last.
 
 ## Chat Key Mappings
 

@@ -339,60 +339,81 @@ function M.select_model()
   async.run(function()
     local models = client:models()
     local selected_id = resolve_selected_id(models)
-    local result = vim.tbl_keys(models)
+    local groups = {}
+    local groups_by_provider = {}
 
-    table.sort(result, function(a, b)
-      a = models[a]
-      b = models[b]
+    local function visible(model)
+      return model.picker == nil or model.id == 'auto' or vim.startswith(model.id, 'auto:') or model.picker
+    end
 
-      local a_auto = a.id == 'auto' or vim.startswith(a.id, 'auto:')
-      local b_auto = b.id == 'auto' or vim.startswith(b.id, 'auto:')
+    for _, model in pairs(models) do
+      if visible(model) and not model.reasoning_effort_index then
+        local group = { model = model, efforts = {} }
+        table.insert(groups, group)
+        local provider = model.provider or ''
+        local model_id = model.request_model or model.id
+        groups_by_provider[provider] = groups_by_provider[provider] or {}
+        local by_model = groups_by_provider[provider]
+        by_model[model_id] = by_model[model_id] == nil and group or false
+      end
+    end
+
+    for _, model in pairs(models) do
+      if visible(model) and model.reasoning_effort_index then
+        local by_model = groups_by_provider[model.provider or '']
+        local group = by_model and by_model[model.request_model or model.id]
+        if group then
+          table.insert(group.efforts, model)
+        else
+          log.warn('No unambiguous base model for reasoning effort ' .. model.id)
+          table.insert(groups, { model = model, efforts = {} })
+        end
+      end
+    end
+
+    local function output_cost(model)
+      local value = model.output_credits
+      if type(value) == 'number' and value >= 0 and value < math.huge and value == value then
+        return value
+      end
+    end
+
+    table.sort(groups, function(a, b)
+      a, b = a.model, b.model
+      if (a.id == 'auto') ~= (b.id == 'auto') then
+        return a.id == 'auto'
+      end
+      local a_auto = vim.startswith(a.id, 'auto:')
+      local b_auto = vim.startswith(b.id, 'auto:')
       if a_auto ~= b_auto then
         return a_auto
       end
-
-      if a.provider ~= b.provider then
-        return (a.provider or '') < (b.provider or '')
+      local a_cost, b_cost = output_cost(a), output_cost(b)
+      if a_cost ~= b_cost then
+        if a_cost == nil then
+          return false
+        end
+        if b_cost == nil then
+          return true
+        end
+        return a_cost < b_cost
       end
-
-      local a_model = a.request_model or a.id
-      local b_model = b.request_model or b.id
+      local a_provider, b_provider = a.provider or '', b.provider or ''
+      if a_provider ~= b_provider then
+        return a_provider < b_provider
+      end
+      local a_model, b_model = a.request_model or a.id, b.request_model or b.id
       if a_model ~= b_model then
         return a_model < b_model
       end
-
-      local a_effort = a.reasoning_effort_index or 0
-      local b_effort = b.reasoning_effort_index or 0
-      if a_effort ~= b_effort then
-        return a_effort < b_effort
-      end
-
       return a.id < b.id
     end)
-
-    local sorted = {}
-    for _, id in ipairs(result) do
-      local model = models[id]
-      local keep = model.picker == nil or model.id == 'auto' or vim.startswith(model.id, 'auto:') or model.picker
-      if keep then
-        table.insert(sorted, model)
-      end
-    end
 
     -- Build the choices. Every choice gets a `code` such as `3` (model) or `3b` (model + effort)
     local choices = {}
     local codes = {}
-    local model_index = 0
-
-    for _, model in ipairs(sorted) do
-      local code
-      if model.reasoning_effort_index then
-        code = tostring(model_index) .. effort_suffix(model.reasoning_effort_index)
-      else
-        model_index = model_index + 1
-        code = tostring(model_index)
-      end
-
+    local function add_choice(model, model_index, effort_index)
+      local code = tostring(model_index) .. (effort_index and effort_suffix(effort_index) or '')
       local choice = {
         id = model.id,
         name = model.name,
@@ -401,7 +422,7 @@ function M.select_model()
         tools = model.tools,
         reasoning = model.reasoning,
         reasoning_effort = model.reasoning_effort,
-        reasoning_effort_index = model.reasoning_effort_index,
+        reasoning_effort_index = effort_index,
         input_credits = model.input_credits,
         output_credits = model.output_credits,
         model_index = model_index,
@@ -411,6 +432,19 @@ function M.select_model()
 
       table.insert(choices, choice)
       codes[code:lower()] = choice
+    end
+
+    for model_index, group in ipairs(groups) do
+      add_choice(group.model, model_index)
+      table.sort(group.efforts, function(a, b)
+        if a.reasoning_effort_index ~= b.reasoning_effort_index then
+          return a.reasoning_effort_index < b.reasoning_effort_index
+        end
+        return a.id < b.id
+      end)
+      for effort_index, model in ipairs(group.efforts) do
+        add_choice(model, model_index, effort_index)
+      end
     end
 
     local function credit_rates(item)
