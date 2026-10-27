@@ -38,13 +38,23 @@ describe('CopilotChat model picker pricing', function()
           input_credits = 100,
           output_credits = 500,
         },
+        ['priced:low'] = {
+          id = 'priced:low',
+          request_model = 'priced',
+          name = 'Priced (low)',
+          provider = 'copilot',
+          reasoning_effort = 'low',
+          reasoning_effort_index = 1,
+          input_credits = 100,
+          output_credits = 500,
+        },
         ['priced:high'] = {
           id = 'priced:high',
           request_model = 'priced',
           name = 'Priced (high)',
           provider = 'copilot',
           reasoning_effort = 'high',
-          reasoning_effort_index = 1,
+          reasoning_effort_index = 2,
           input_credits = 100,
           output_credits = 500,
         },
@@ -82,7 +92,8 @@ describe('CopilotChat model picker pricing', function()
 
     assert.equals('1. Auto (Copilot) [?/?, copilot]', labels.auto)
     assert.equals('* 2. Priced [100/500, copilot, streaming, tools]', labels.priced)
-    assert.equals('      2a. High [100/500]', labels['priced:high'])
+    assert.equals('      2a. Low', labels['priced:low'])
+    assert.equals('      2b. High', labels['priced:high'])
     assert.equals('4. Partial [0/0.125, other]', labels.partial)
     assert.equals('5. Missing output [10/?, other]', labels.zpartial)
     assert.equals('3. Invalid [?/?, other]', labels.invalid)
@@ -95,6 +106,8 @@ describe('CopilotChat model picker pricing', function()
       end
     end
     assert.equals('priced:high', chat.config.model)
+    chat.select_model()
+    assert.equals('    * 2b. High', labels['priced:high'])
   end)
 
   it('renders rates in the built-in picker and selects an effort code', function()
@@ -112,12 +125,14 @@ describe('CopilotChat model picker pricing', function()
 
     assert.truthy(displayed:find('Auto %(Copilot%) %[%?/%?, copilot%]'))
     assert.truthy(displayed:find('Priced %[100/500, copilot, streaming, tools%]'))
-    assert.truthy(displayed:find('2a%. High %[100/500%]'))
+    assert.truthy(displayed:find('2a. Low - 2b. High', 1, true))
     assert.truthy(displayed:find('Partial %[0/0%.125, other%]'))
     assert.truthy(displayed:find('Missing output %[10/%?, other%]'))
     on_input('')
     assert.equals('priced', chat.config.model)
-    on_input('2a')
+    on_input('2b')
     assert.equals('priced:high', chat.config.model)
+    chat.select_model()
+    assert.truthy(displayed:find('2a. Low - *2b. High', 1, true))
   end)
 end)

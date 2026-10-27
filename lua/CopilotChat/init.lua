@@ -482,7 +482,7 @@ function M.select_model()
 
       for _, item in ipairs(choices) do
         if item.reasoning_effort_index then
-          local part = string.format('%s. %s [%s]', item.code, effort_name(item.reasoning_effort), credit_rates(item))
+          local part = string.format('%s. %s', item.code, effort_name(item.reasoning_effort))
           if item.selected then
             part = '*' .. part
           end
@@ -528,7 +528,7 @@ function M.select_model()
       prompt = 'Select a model and reasoning effort> ',
       format_item = function(item)
         if item.reasoning_effort_index then
-          local out = string.format('%s. %s [%s]', item.code, effort_name(item.reasoning_effort), credit_rates(item))
+          local out = string.format('%s. %s', item.code, effort_name(item.reasoning_effort))
 
           if item.selected then
             return '    * ' .. out
