@@ -402,7 +402,8 @@ function M.select_model()
         reasoning = model.reasoning,
         reasoning_effort = model.reasoning_effort,
         reasoning_effort_index = model.reasoning_effort_index,
-        multiplier = model.multiplier,
+        input_credits = model.input_credits,
+        output_credits = model.output_credits,
         model_index = model_index,
         code = code,
         selected = selected_id ~= nil and model.id == selected_id,
@@ -412,14 +413,26 @@ function M.select_model()
       codes[code:lower()] = choice
     end
 
+    local function credit_rates(item)
+      local function rate(value, name)
+        if value == nil or value == vim.NIL then
+          return '?'
+        end
+        if type(value) ~= 'number' or value < 0 or value >= math.huge or value ~= value then
+          log.warn('Invalid ' .. name .. ' AI Credit rate for model ' .. item.id)
+          return '?'
+        end
+        return tostring(value)
+      end
+
+      return rate(item.input_credits, 'input') .. '/' .. rate(item.output_credits, 'output')
+    end
+
     --- Build the model line (without code and selection marker)
     ---@param item table
     ---@return string
     local function model_description(item)
-      local indicators = {}
-      if item.multiplier ~= nil then
-        table.insert(indicators, 'x' .. tostring(item.multiplier))
-      end
+      local indicators = { credit_rates(item) }
       if item.provider then
         table.insert(indicators, item.provider)
       end
@@ -469,7 +482,7 @@ function M.select_model()
 
       for _, item in ipairs(choices) do
         if item.reasoning_effort_index then
-          local part = string.format('%s. %s', item.code, effort_name(item.reasoning_effort))
+          local part = string.format('%s. %s [%s]', item.code, effort_name(item.reasoning_effort), credit_rates(item))
           if item.selected then
             part = '*' .. part
           end
@@ -515,7 +528,7 @@ function M.select_model()
       prompt = 'Select a model and reasoning effort> ',
       format_item = function(item)
         if item.reasoning_effort_index then
-          local out = string.format('%s. %s', item.code, effort_name(item.reasoning_effort))
+          local out = string.format('%s. %s [%s]', item.code, effort_name(item.reasoning_effort), credit_rates(item))
 
           if item.selected then
             return '    * ' .. out

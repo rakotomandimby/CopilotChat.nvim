@@ -546,6 +546,59 @@ end
 ---@field prepare_output nil|fun(output:table, opts:CopilotChat.config.providers.Options):CopilotChat.config.providers.Output
 ---@field get_url nil|fun(opts:CopilotChat.config.providers.Options):string
 
+local function model_credit_rates(model)
+  local billing = model.billing
+  if billing == nil or billing == vim.NIL then
+    return nil, nil
+  end
+  if type(billing) ~= 'table' then
+    log.warn('Invalid billing metadata for model ' .. model.id)
+    return nil, nil
+  end
+
+  local prices = billing.token_prices
+  if prices == nil or prices == vim.NIL then
+    return nil, nil
+  end
+  if type(prices) ~= 'table' then
+    log.warn('Invalid token pricing for model ' .. model.id)
+    return nil, nil
+  end
+
+  local default = prices.default
+  if default == nil or default == vim.NIL then
+    return nil, nil
+  end
+  if type(default) ~= 'table' then
+    log.warn('Invalid default token pricing for model ' .. model.id)
+    return nil, nil
+  end
+
+  local batch_size = prices.batch_size
+  if type(batch_size) ~= 'number' or batch_size <= 0 or batch_size >= math.huge or batch_size ~= batch_size then
+    log.warn('Invalid token pricing batch size for model ' .. model.id)
+    return nil, nil
+  end
+
+  local function rate(value, name)
+    if value == nil or value == vim.NIL then
+      return nil
+    end
+    if type(value) ~= 'number' or value < 0 or value >= math.huge or value ~= value then
+      log.warn('Invalid ' .. name .. ' token price for model ' .. model.id)
+      return nil
+    end
+    local normalized = value * (1000000 / batch_size)
+    if normalized >= math.huge or normalized ~= normalized then
+      log.warn('Invalid normalized ' .. name .. ' token price for model ' .. model.id)
+      return nil
+    end
+    return normalized
+  end
+
+  return rate(default.input_price, 'input'), rate(default.output_price, 'output')
+end
+
 ---@type table<string, CopilotChat.config.providers.Provider>
 local M = {}
 
@@ -638,9 +691,10 @@ M.copilot = {
     local request_headers = vim.tbl_extend('force', {}, headers)
     request_headers['x-copilot-base-url'] = nil
 
+    -- Token pricing requires the newer model-list API version.
     local response, err = curl.get(base_url .. '/models', {
       json_response = true,
-      headers = request_headers,
+      headers = vim.tbl_extend('force', request_headers, { ['x-github-api-version'] = '2026-08-01' }),
     })
 
     if err then
@@ -659,6 +713,7 @@ M.copilot = {
         local supports = model.capabilities.supports or {}
         local limits = model.capabilities.limits or {}
         local reasoning_efforts = {}
+        local input_credits, output_credits = model_credit_rates(model)
 
         if type(supports.reasoning_effort) == 'table' then
           for _, effort in ipairs(supports.reasoning_effort) do
@@ -681,7 +736,8 @@ M.copilot = {
           reasoning_efforts = reasoning_efforts,
           policy = not model['policy'] or model['policy']['state'] == 'enabled',
           version = model.version,
-          multiplier = model.billing and model.billing.multiplier or nil,
+          input_credits = input_credits,
+          output_credits = output_credits,
           use_responses = use_responses,
           picker = not not model.model_picker_enabled,
           base_url = base_url,

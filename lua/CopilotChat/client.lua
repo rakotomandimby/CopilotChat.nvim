@@ -56,6 +56,8 @@
 ---@field reasoning_efforts string[]?
 ---@field reasoning_effort string?
 ---@field reasoning_effort_index integer?
+---@field input_credits number? AI Credits per million input tokens
+---@field output_credits number? AI Credits per million output tokens
 ---@field picker boolean?
 
 local log = require('plenary.log')

@@ -1,8 +1,10 @@
 describe('CopilotChat copilot provider models', function()
   local curl = require('CopilotChat.utils.curl')
   local providers = require('CopilotChat.config.providers')
+  local log = require('plenary.log')
   local original_get = curl.get
   local original_post = curl.post
+  local original_warn = log.warn
 
   before_each(function()
     curl.get = function()
@@ -16,6 +18,7 @@ describe('CopilotChat copilot provider models', function()
   after_each(function()
     curl.get = original_get
     curl.post = original_post
+    log.warn = original_warn
   end)
 
   local function model(id, picker, supported_endpoints)
@@ -83,6 +86,76 @@ describe('CopilotChat copilot provider models', function()
     assert.is_true(by_id['gpt-5.4-mini'].use_responses)
     assert.is_false(by_id['gpt-5.4-restricted'].picker)
     assert.is_false(by_id['gpt-5.4-restricted'].use_responses)
+  end)
+
+  it('normalizes default AI Credit rates and preserves them on reasoning variants', function()
+    local priced = model('priced', true, { '/responses' })
+    priced.billing = {
+      token_prices = {
+        batch_size = 100000,
+        default = { input_price = 12.5, output_price = 0 },
+        long_context = { input_price = 999, output_price = 999 },
+      },
+    }
+    priced.capabilities.supports.reasoning_effort = { 'high' }
+    priced.policy = { state = 'disabled' }
+    local partial = model('partial', true, {})
+    partial.billing = { token_prices = { batch_size = 1000000, default = { output_price = 0.125 } } }
+    local unpriced = model('unpriced', true, {})
+
+    local captured_headers, policy_headers
+    curl.get = function(_, opts)
+      captured_headers = opts.headers
+      return { body = { data = { priced, partial, unpriced } } }
+    end
+    curl.post = function(_, opts)
+      policy_headers = opts.headers
+      return { body = {} }
+    end
+
+    local headers = { ['x-github-api-version'] = '2025-10-01', ['x-copilot-base-url'] = 'https://example.test' }
+    local by_id = {}
+    for _, item in ipairs(providers.copilot.get_models(headers)) do
+      by_id[item.id] = item
+    end
+    assert.equals('2026-08-01', captured_headers['x-github-api-version'])
+    assert.is_nil(captured_headers['x-copilot-base-url'])
+    assert.equals('2025-10-01', headers['x-github-api-version'])
+    assert.equals('2025-10-01', policy_headers['x-github-api-version'])
+    assert.equals(125, by_id.priced.input_credits)
+    assert.equals(0, by_id.priced.output_credits)
+    assert.equals(125, by_id['priced:high'].input_credits)
+    assert.equals(0, by_id['priced:high'].output_credits)
+    assert.is_nil(by_id.partial.input_credits)
+    assert.equals(0.125, by_id.partial.output_credits)
+    assert.is_nil(by_id.unpriced.input_credits)
+    assert.is_nil(by_id.auto.output_credits)
+  end)
+
+  it('reports malformed pricing and leaves invalid rates unknown', function()
+    local warnings = {}
+    log.warn = function(message)
+      table.insert(warnings, message)
+    end
+
+    local invalid_rate = model('invalid-rate', true, {})
+    invalid_rate.billing =
+      { token_prices = { batch_size = 1000000, default = { input_price = 'bad', output_price = 5 } } }
+    local invalid_batch = model('invalid-batch', true, {})
+    invalid_batch.billing = { token_prices = { batch_size = 0, default = { input_price = 10, output_price = 20 } } }
+    curl.get = function()
+      return { body = { data = { invalid_rate, invalid_batch } } }
+    end
+
+    local by_id = {}
+    for _, item in ipairs(providers.copilot.get_models({})) do
+      by_id[item.id] = item
+    end
+    assert.is_nil(by_id['invalid-rate'].input_credits)
+    assert.equals(5, by_id['invalid-rate'].output_credits)
+    assert.is_nil(by_id['invalid-batch'].input_credits)
+    assert.is_nil(by_id['invalid-batch'].output_credits)
+    assert.equals(2, #warnings)
   end)
 
   it('returns the selected model and session token for auto', function()
