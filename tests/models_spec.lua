@@ -396,4 +396,79 @@ describe('CopilotChat copilot provider models', function()
     assert.equals('gpt-5.4:custom', resolved)
     assert.equals('Hello', vim.trim(prompt))
   end)
+
+  describe('get_info', function()
+    --- Provide a fake GitHub token through the environment so no auth flow is started.
+    local function with_env_token()
+      local previous = { CODESPACES = vim.env.CODESPACES, GITHUB_TOKEN = vim.env.GITHUB_TOKEN }
+      vim.uv.os_setenv('CODESPACES', '1')
+      vim.uv.os_setenv('GITHUB_TOKEN', 'test-token')
+      table.insert(restores, function()
+        for name, value in pairs(previous) do
+          if value == nil then
+            vim.uv.os_unsetenv(name)
+          else
+            vim.uv.os_setenv(name, value)
+          end
+        end
+      end)
+    end
+
+    --- Serve `body` from the user info endpoint and return the rendered info text.
+    local function info_for(body)
+      with_env_token()
+      patch(curl, 'get', function()
+        return { body = body }
+      end)
+      return table.concat(providers.copilot.get_info({}), '\n')
+    end
+
+    it('reports AI Credits (AIC) instead of premium requests and omits chat', function()
+      local text = info_for({
+        quota_snapshots = {
+          premium_interactions = { entitlement = 20000, remaining = 19691, overage_permitted = false },
+          chat = { unlimited = true },
+          completions = { unlimited = true },
+        },
+        quota_reset_date = '2026-11-01',
+      })
+
+      assert.truthy(text:find('**AI Credits (AIC)**', 1, true))
+      assert.truthy(text:find('Usage: 309 / 20000 (1.5%)', 1, true))
+      assert.truthy(text:find('Remaining: 19691', 1, true))
+      assert.truthy(text:find('Overage: Not Permitted', 1, true))
+      assert.is_nil(text:find('Premium requests', 1, true))
+      assert.is_nil(text:find('**Chat**', 1, true))
+      assert.truthy(text:find('**Completions**', 1, true))
+      assert.truthy(text:find('resets on: 2026-11-01', 1, true))
+    end)
+
+    it('prefers the ai_credits snapshot over the legacy key', function()
+      local text = info_for({
+        quota_snapshots = {
+          ai_credits = { entitlement = 100, remaining = 40 },
+          premium_interactions = { entitlement = 20000, remaining = 19691 },
+        },
+      })
+
+      assert.truthy(text:find('Usage: 60 / 100 (60.0%)', 1, true))
+      assert.is_nil(text:find('20000', 1, true))
+    end)
+
+    it('shows fractional credit amounts', function()
+      local text = info_for({
+        quota_snapshots = {
+          ai_credits = { entitlement = 100, remaining = 87.5 },
+        },
+      })
+
+      assert.truthy(text:find('Usage: 12.5 / 100 (12.5%)', 1, true))
+      assert.truthy(text:find('Remaining: 87.5', 1, true))
+    end)
+
+    it('handles missing stats', function()
+      assert.equals('No Copilot stats available.', info_for({}))
+    end)
+  end)
 end)
+

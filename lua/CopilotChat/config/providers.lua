@@ -634,6 +634,18 @@ local function unique_efforts(list)
   return out
 end
 
+--- Format a quota amount: integers without decimals, fractions with up to 2 decimals.
+---@param value number
+---@return string
+local function format_amount(value)
+  if value == math.floor(value) then
+    return string.format('%d', value)
+  end
+  local text = string.format('%.2f', value)
+  text = text:gsub('0+$', ''):gsub('%.$', '')
+  return text
+end
+
 ---@type table<string, CopilotChat.config.providers.Provider>
 local M = {}
 
@@ -695,20 +707,25 @@ M.copilot = {
 
       if snap.unlimited then
         table.insert(lines, '    Usage: Unlimited')
-      else
+      elseif type(snap.entitlement) == 'number' and type(snap.remaining) == 'number' then
         local used = snap.entitlement - snap.remaining
         local percent = snap.entitlement > 0 and (used / snap.entitlement * 100) or 0
-        table.insert(lines, string.format('   Usage: %d / %d (%.1f%%)', used, snap.entitlement, percent))
-        table.insert(lines, string.format('   Remaining: %d', snap.remaining))
+        table.insert(
+          lines,
+          string.format('   Usage: %s / %s (%.1f%%)', format_amount(used), format_amount(snap.entitlement), percent)
+        )
+        table.insert(lines, string.format('   Remaining: %s', format_amount(snap.remaining)))
         if snap.overage_permitted ~= nil then
           table.insert(lines, '   Overage: ' .. (snap.overage_permitted and 'Permitted' or 'Not Permitted'))
         end
       end
     end
 
-    usage_line('Premium requests', stats.quota_snapshots.premium_interactions)
-    usage_line('Chat', stats.quota_snapshots.chat)
-    usage_line('Completions', stats.quota_snapshots.completions)
+    -- "Premium requests" is a legacy term, usage is now reported as AI Credits (AIC).
+    -- Prefer the new snapshot key and fall back to the legacy one.
+    local snapshots = stats.quota_snapshots
+    usage_line('AI Credits (AIC)', snapshots.ai_credits or snapshots.premium_interactions)
+    usage_line('Completions', snapshots.completions)
 
     if stats.quota_reset_date then
       table.insert(lines, string.format(' **Quota** resets on: %s', stats.quota_reset_date))
@@ -945,3 +962,4 @@ M.github_models = {
 }
 
 return M
+
