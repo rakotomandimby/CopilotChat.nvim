@@ -235,6 +235,35 @@ function M.empty(v)
   return false
 end
 
+--- Check if a value is a valid rate: a finite, non-negative number (NaN is rejected)
+---@param value any
+---@return boolean
+function M.is_rate(value)
+  return type(value) == 'number' and value >= 0 and value < math.huge and value == value
+end
+
+--- Check if a value is missing (`nil` or `vim.NIL`)
+---@param value any
+---@return boolean
+function M.is_missing(value)
+  return value == nil or value == vim.NIL
+end
+
+--- Check whether `vim.ui.select` is still the built-in implementation.
+--- The built-in implementation is based on `inputlist()` and can only select by flat list position.
+---@return boolean
+function M.is_default_select()
+  local info = debug.getinfo(vim.ui.select, 'S')
+  return info ~= nil and info.source:match('[/\\]vim[/\\]ui%.lua$') ~= nil
+end
+
+--- Check whether a model id refers to an Auto model (`auto` or `auto:<provider>`)
+---@param id string
+---@return boolean
+function M.is_auto_model(id)
+  return id == 'auto' or vim.startswith(id, 'auto:')
+end
+
 --- Split text into lines
 ---@param text string The text to split
 ---@return string[] A table of lines
@@ -247,3 +276,4 @@ function M.split_lines(text)
 end
 
 return M
+

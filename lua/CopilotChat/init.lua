@@ -279,6 +279,29 @@ local function update_source()
   M.chat:set_source(use_prev_window and vim.fn.win_getid(vim.fn.winnr('#')) or vim.api.nvim_get_current_win())
 end
 
+-- Model picker helpers ------------------------------------------------------
+
+---@alias CopilotChat.PickerStyle 'list'|'select'
+
+---@class CopilotChat.ModelGroup
+---@field model CopilotChat.client.Model Base model (or standalone effort variant) with sanitized rates
+---@field efforts CopilotChat.client.Model[] Reasoning effort variants of the base model
+---@field key table Sort key of the base model
+
+--- Get the letter (or numeric) suffix used to label a reasoning effort level.
+---@param index integer
+---@return string
+local function effort_suffix(index)
+  return index <= 26 and string.char(96 + index) or '.' .. tostring(index)
+end
+
+--- Get the human readable name of a reasoning effort level.
+---@param effort string
+---@return string
+local function effort_name(effort)
+  return EFFORT_NAMES[effort] or (effort:gsub('^%l', string.upper))
+end
+
 --- Resolve which entry of the fetched model list matches the currently stored selection.
 --- The selection is stored as a single id in `M.config.model` (for example `gpt-5.4:high`,
 --- where the suffix is the reasoning effort).
@@ -312,26 +335,307 @@ local function resolve_selected_id(models)
   return nil
 end
 
---- Get the letter (or numeric) suffix used to label a reasoning effort level.
----@param index integer
----@return string
-local function effort_suffix(index)
-  return index <= 26 and string.char(96 + index) or '.' .. tostring(index)
-end
-
---- Get the human readable name of a reasoning effort level.
----@param effort string
----@return string
-local function effort_name(effort)
-  return EFFORT_NAMES[effort] or (effort:gsub('^%l', string.upper))
-end
-
---- Check whether `vim.ui.select` is still the built-in implementation.
---- The built-in implementation is based on `inputlist()` and can only select by flat list position.
+--- Whether a model is shown in the picker.
+---@param model CopilotChat.client.Model
 ---@return boolean
-local function uses_default_select()
-  local info = debug.getinfo(vim.ui.select, 'S')
-  return info ~= nil and info.source:match('[/\\]vim[/\\]ui%.lua$') ~= nil
+local function is_visible(model)
+  return model.picker ~= false or utils.is_auto_model(model.id)
+end
+
+--- Return the rate when it is valid, nil when it is missing or invalid.
+--- Invalid values are reported once.
+---@param value any
+---@param kind string 'input' or 'output'
+---@param id string Model id
+---@return number?
+local function sanitize_rate(value, kind, id)
+  if utils.is_missing(value) then
+    return nil
+  end
+  if not utils.is_rate(value) then
+    log.warn('Invalid ' .. kind .. ' AI Credit rate for model ' .. id)
+    return nil
+  end
+  return value
+end
+
+--- Shallow copy of a model with validated AI Credit rates.
+---@param model CopilotChat.client.Model
+---@return CopilotChat.client.Model
+local function with_sanitized_rates(model)
+  local copy = vim.tbl_extend('force', {}, model)
+  copy.input_credits = sanitize_rate(model.input_credits, 'input', model.id)
+  copy.output_credits = sanitize_rate(model.output_credits, 'output', model.id)
+  return copy
+end
+
+--- Sort key of a model: Auto first, then Auto:<provider>, then cheapest output
+--- (unknown cost last), then provider, request model and id.
+---@param model CopilotChat.client.Model
+---@return table
+local function sort_key(model)
+  local auto_rank = 2
+  if model.id == 'auto' then
+    auto_rank = 0
+  elseif utils.is_auto_model(model.id) then
+    auto_rank = 1
+  end
+
+  return {
+    auto_rank,
+    model.output_credits or math.huge,
+    model.provider or '',
+    model.request_model or model.id,
+    model.id,
+  }
+end
+
+--- Lexicographic comparison of two equally shaped tuples.
+---@param a table
+---@param b table
+---@return boolean
+local function compare_keys(a, b)
+  for i = 1, #a do
+    if a[i] ~= b[i] then
+      return a[i] < b[i]
+    end
+  end
+  return false
+end
+
+--- Group the visible models into base models with their reasoning effort variants,
+--- sorted in display order. Rates are validated here, once per model.
+---@param models table<string, CopilotChat.client.Model>
+---@return CopilotChat.ModelGroup[]
+local function group_models(models)
+  local groups = {}
+  local by_base = {}
+  local ambiguous = {}
+
+  local function base_key(model)
+    return (model.provider or '') .. '\0' .. (model.request_model or model.id)
+  end
+
+  local function new_group(model)
+    local sanitized = with_sanitized_rates(model)
+    local group = { model = sanitized, efforts = {}, key = sort_key(sanitized) }
+    table.insert(groups, group)
+    return group
+  end
+
+  -- Base models first, so the variants below can attach to them
+  for _, model in pairs(models) do
+    if is_visible(model) and not model.reasoning_effort_index then
+      local group = new_group(model)
+      local key = base_key(model)
+      if by_base[key] then
+        ambiguous[key] = true
+      else
+        by_base[key] = group
+      end
+    end
+  end
+
+  for _, model in pairs(models) do
+    if is_visible(model) and model.reasoning_effort_index then
+      local key = base_key(model)
+      local group = not ambiguous[key] and by_base[key]
+      if group then
+        table.insert(group.efforts, with_sanitized_rates(model))
+      else
+        log.warn('No unambiguous base model for reasoning effort ' .. model.id)
+        new_group(model)
+      end
+    end
+  end
+
+  table.sort(groups, function(a, b)
+    return compare_keys(a.key, b.key)
+  end)
+
+  return groups
+end
+
+--- Build a picker choice. The model must already have validated rates.
+--- `reasoning_effort_index` is the local position inside the group (the one used by the
+--- code), which stays unique even if the provider indexes collide.
+---@param model CopilotChat.client.Model
+---@param model_index integer
+---@param effort_index integer?
+---@param selected_id string?
+---@return table
+local function make_choice(model, model_index, effort_index, selected_id)
+  local choice = vim.tbl_extend('force', model, {
+    model_index = model_index,
+    code = tostring(model_index) .. (effort_index and effort_suffix(effort_index) or ''),
+    selected = selected_id ~= nil and model.id == selected_id,
+  })
+  choice.reasoning_effort_index = effort_index
+  return choice
+end
+
+--- Build the choices (models followed by their efforts) and the code lookup table.
+--- Every choice gets a `code` such as `3` (model) or `3b` (model + effort).
+---@param groups CopilotChat.ModelGroup[]
+---@param selected_id string?
+---@return table[] choices
+---@return table<string, table> codes Lowercase code to choice
+local function build_choices(groups, selected_id)
+  local choices = {}
+  local codes = {}
+
+  local function add(model, model_index, effort_index)
+    local choice = make_choice(model, model_index, effort_index, selected_id)
+    table.insert(choices, choice)
+    codes[choice.code:lower()] = choice
+  end
+
+  for model_index, group in ipairs(groups) do
+    add(group.model, model_index)
+
+    table.sort(group.efforts, function(a, b)
+      return compare_keys({ a.reasoning_effort_index, a.id }, { b.reasoning_effort_index, b.id })
+    end)
+    for effort_index, effort in ipairs(group.efforts) do
+      add(effort, model_index, effort_index)
+    end
+  end
+
+  return choices, codes
+end
+
+--- Format the AI Credit rates as `<input>/<output>`, with `?` for unknown values.
+---@param choice table
+---@return string
+local function format_credits(choice)
+  local function rate(value)
+    return value == nil and '?' or tostring(value)
+  end
+
+  return rate(choice.input_credits) .. '/' .. rate(choice.output_credits)
+end
+
+--- Format the model name with its indicators.
+---@param choice table
+---@return string
+local function format_description(choice)
+  local indicators = { format_credits(choice) }
+  if choice.provider then
+    table.insert(indicators, choice.provider)
+  end
+  if choice.streaming then
+    table.insert(indicators, 'streaming')
+  end
+  if choice.tools then
+    table.insert(indicators, 'tools')
+  end
+  if choice.reasoning then
+    table.insert(indicators, 'reasoning')
+  end
+
+  return string.format('%s [%s]', choice.name, table.concat(indicators, ', '))
+end
+
+--- Format a model line: `<marker><code>. <description>`.
+---@param choice table
+---@param style CopilotChat.PickerStyle
+---@return string
+local function format_model_line(choice, style)
+  local marker = choice.selected and '* ' or (style == 'list' and '  ' or '')
+  return string.format('%s%s. %s', marker, choice.code, format_description(choice))
+end
+
+--- Format an effort entry: `<code>. <Effort Name>` with the selection marker.
+---@param choice table
+---@param style CopilotChat.PickerStyle
+---@return string
+local function format_effort_line(choice, style)
+  local text = string.format('%s. %s', choice.code, effort_name(choice.reasoning_effort))
+
+  if style == 'list' then
+    return (choice.selected and '*' or '') .. text
+  end
+  return (choice.selected and '    * ' or '      ') .. text
+end
+
+---@param choice table
+---@param style CopilotChat.PickerStyle
+---@return string
+local function format_choice(choice, style)
+  if choice.reasoning_effort_index then
+    return format_effort_line(choice, style)
+  end
+  return format_model_line(choice, style)
+end
+
+--- Store the selected choice. The id already encodes the reasoning effort
+--- (`<model>:<effort>`), so it is used as is by `client:ask()`.
+---@param choice table?
+local function apply_choice(choice)
+  if not choice then
+    return
+  end
+
+  M.config.model = choice.id
+  log.info('Selected model: ' .. choice.id)
+end
+
+--- Built-in picker: `vim.ui.select` can only pick by flat list position there, so codes such
+--- as `10c` would be misinterpreted. Show the grouped list and read the code instead.
+---@param choices table[]
+---@param codes table<string, table>
+---@param apply fun(choice: table?)
+local function pick_with_codes(choices, codes, apply)
+  local lines = {}
+  local effort_parts = {}
+
+  local function flush_efforts()
+    if #effort_parts > 0 then
+      table.insert(lines, '      ' .. table.concat(effort_parts, ' - '))
+      effort_parts = {}
+    end
+  end
+
+  for _, choice in ipairs(choices) do
+    if choice.reasoning_effort_index then
+      table.insert(effort_parts, format_choice(choice, 'list'))
+    else
+      flush_efforts()
+      table.insert(lines, format_choice(choice, 'list'))
+    end
+  end
+  flush_efforts()
+
+  vim.api.nvim_echo({ { 'Select a model and reasoning effort:\n' .. table.concat(lines, '\n') .. '\n' } }, false, {})
+
+  vim.ui.input({
+    prompt = 'Enter a code (e.g. 3 or 10c)> ',
+  }, function(input)
+    input = input and vim.trim(input):lower() or ''
+    if input == '' then
+      return
+    end
+
+    local choice = codes[input]
+    if not choice then
+      vim.notify('Unknown model selection: ' .. input, vim.log.levels.WARN)
+      return
+    end
+
+    apply(choice)
+  end)
+end
+
+--- Custom pickers (telescope, fzf-lua, snacks, ...) display the labels as is.
+---@param choices table[]
+---@param apply fun(choice: table?)
+local function pick_with_select(choices, apply)
+  vim.ui.select(choices, {
+    prompt = 'Select a model and reasoning effort> ',
+    format_item = function(item)
+      return format_choice(item, 'select')
+    end,
+  }, apply)
 end
 
 --- Select default Copilot GPT model.
@@ -339,246 +643,15 @@ function M.select_model()
   async.run(function()
     local models = client:models()
     local selected_id = resolve_selected_id(models)
-    local groups = {}
-    local groups_by_provider = {}
-
-    local function visible(model)
-      return model.picker == nil or model.id == 'auto' or vim.startswith(model.id, 'auto:') or model.picker
-    end
-
-    for _, model in pairs(models) do
-      if visible(model) and not model.reasoning_effort_index then
-        local group = { model = model, efforts = {} }
-        table.insert(groups, group)
-        local provider = model.provider or ''
-        local model_id = model.request_model or model.id
-        groups_by_provider[provider] = groups_by_provider[provider] or {}
-        local by_model = groups_by_provider[provider]
-        by_model[model_id] = by_model[model_id] == nil and group or false
-      end
-    end
-
-    for _, model in pairs(models) do
-      if visible(model) and model.reasoning_effort_index then
-        local by_model = groups_by_provider[model.provider or '']
-        local group = by_model and by_model[model.request_model or model.id]
-        if group then
-          table.insert(group.efforts, model)
-        else
-          log.warn('No unambiguous base model for reasoning effort ' .. model.id)
-          table.insert(groups, { model = model, efforts = {} })
-        end
-      end
-    end
-
-    local function output_cost(model)
-      local value = model.output_credits
-      if type(value) == 'number' and value >= 0 and value < math.huge and value == value then
-        return value
-      end
-    end
-
-    table.sort(groups, function(a, b)
-      a, b = a.model, b.model
-      if (a.id == 'auto') ~= (b.id == 'auto') then
-        return a.id == 'auto'
-      end
-      local a_auto = vim.startswith(a.id, 'auto:')
-      local b_auto = vim.startswith(b.id, 'auto:')
-      if a_auto ~= b_auto then
-        return a_auto
-      end
-      local a_cost, b_cost = output_cost(a), output_cost(b)
-      if a_cost ~= b_cost then
-        if a_cost == nil then
-          return false
-        end
-        if b_cost == nil then
-          return true
-        end
-        return a_cost < b_cost
-      end
-      local a_provider, b_provider = a.provider or '', b.provider or ''
-      if a_provider ~= b_provider then
-        return a_provider < b_provider
-      end
-      local a_model, b_model = a.request_model or a.id, b.request_model or b.id
-      if a_model ~= b_model then
-        return a_model < b_model
-      end
-      return a.id < b.id
-    end)
-
-    -- Build the choices. Every choice gets a `code` such as `3` (model) or `3b` (model + effort)
-    local choices = {}
-    local codes = {}
-    local function add_choice(model, model_index, effort_index)
-      local code = tostring(model_index) .. (effort_index and effort_suffix(effort_index) or '')
-      local choice = {
-        id = model.id,
-        name = model.name,
-        provider = model.provider,
-        streaming = model.streaming,
-        tools = model.tools,
-        reasoning = model.reasoning,
-        reasoning_effort = model.reasoning_effort,
-        reasoning_effort_index = effort_index,
-        input_credits = model.input_credits,
-        output_credits = model.output_credits,
-        model_index = model_index,
-        code = code,
-        selected = selected_id ~= nil and model.id == selected_id,
-      }
-
-      table.insert(choices, choice)
-      codes[code:lower()] = choice
-    end
-
-    for model_index, group in ipairs(groups) do
-      add_choice(group.model, model_index)
-      table.sort(group.efforts, function(a, b)
-        if a.reasoning_effort_index ~= b.reasoning_effort_index then
-          return a.reasoning_effort_index < b.reasoning_effort_index
-        end
-        return a.id < b.id
-      end)
-      for effort_index, model in ipairs(group.efforts) do
-        add_choice(model, model_index, effort_index)
-      end
-    end
-
-    local function credit_rates(item)
-      local function rate(value, name)
-        if value == nil or value == vim.NIL then
-          return '?'
-        end
-        if type(value) ~= 'number' or value < 0 or value >= math.huge or value ~= value then
-          log.warn('Invalid ' .. name .. ' AI Credit rate for model ' .. item.id)
-          return '?'
-        end
-        return tostring(value)
-      end
-
-      return rate(item.input_credits, 'input') .. '/' .. rate(item.output_credits, 'output')
-    end
-
-    --- Build the model line (without code and selection marker)
-    ---@param item table
-    ---@return string
-    local function model_description(item)
-      local indicators = { credit_rates(item) }
-      if item.provider then
-        table.insert(indicators, item.provider)
-      end
-      if item.streaming then
-        table.insert(indicators, 'streaming')
-      end
-      if item.tools then
-        table.insert(indicators, 'tools')
-      end
-      if item.reasoning then
-        table.insert(indicators, 'reasoning')
-      end
-
-      local out = item.name
-      if #indicators > 0 then
-        out = out .. ' [' .. table.concat(indicators, ', ') .. ']'
-      end
-      return out
-    end
-
-    --- Store the selected choice. The id already encodes the reasoning effort
-    --- (`<model>:<effort>`), so it is used as is by `client:ask()`.
-    ---@param choice table?
-    local function apply(choice)
-      if not choice then
-        return
-      end
-
-      M.config.model = choice.id
-      log.info('Selected model: ' .. choice.id)
-    end
+    local choices, codes = build_choices(group_models(models), selected_id)
 
     utils.schedule_main()
 
-    if uses_default_select() then
-      -- The built-in vim.ui.select can only pick by flat list position, so codes such
-      -- as `10c` would be misinterpreted. Show the grouped list and read the code instead.
-      local lines = {}
-      local effort_parts = {}
-
-      local function flush_efforts()
-        if #effort_parts > 0 then
-          table.insert(lines, '      ' .. table.concat(effort_parts, ' - '))
-          effort_parts = {}
-        end
-      end
-
-      for _, item in ipairs(choices) do
-        if item.reasoning_effort_index then
-          local part = string.format('%s. %s', item.code, effort_name(item.reasoning_effort))
-          if item.selected then
-            part = '*' .. part
-          end
-          table.insert(effort_parts, part)
-        else
-          flush_efforts()
-          table.insert(
-            lines,
-            string.format('%s%s. %s', item.selected and '* ' or '  ', item.code, model_description(item))
-          )
-        end
-      end
-      flush_efforts()
-
-      vim.api.nvim_echo(
-        { { 'Select a model and reasoning effort:\n' .. table.concat(lines, '\n') .. '\n' } },
-        false,
-        {}
-      )
-
-      vim.ui.input({
-        prompt = 'Enter a code (e.g. 3 or 10c)> ',
-      }, function(input)
-        input = input and vim.trim(input):lower() or ''
-        if input == '' then
-          return
-        end
-
-        local choice = codes[input]
-        if not choice then
-          vim.notify('Unknown model selection: ' .. input, vim.log.levels.WARN)
-          return
-        end
-
-        apply(choice)
-      end)
-
-      return
+    if utils.is_default_select() then
+      pick_with_codes(choices, codes, apply_choice)
+    else
+      pick_with_select(choices, apply_choice)
     end
-
-    -- Custom pickers (telescope, fzf-lua, snacks, ...) display the labels as is
-    vim.ui.select(choices, {
-      prompt = 'Select a model and reasoning effort> ',
-      format_item = function(item)
-        if item.reasoning_effort_index then
-          local out = string.format('%s. %s', item.code, effort_name(item.reasoning_effort))
-
-          if item.selected then
-            return '    * ' .. out
-          end
-
-          return '      ' .. out
-        end
-
-        local out = string.format('%s. %s', item.code, model_description(item))
-        if item.selected then
-          out = '* ' .. out
-        end
-
-        return out
-      end,
-    }, apply)
   end)
 end
 
@@ -1127,3 +1200,4 @@ function M.setup(config)
 end
 
 return M
+

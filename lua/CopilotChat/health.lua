@@ -1,3 +1,5 @@
+local utils = require('CopilotChat.utils')
+
 local M = {}
 
 local start = vim.health.start or vim.health.report_start
@@ -136,13 +138,12 @@ function M.check()
     )
   end
 
-  local select_source = debug.getinfo(vim.ui.select).source
-  if select_source:match('vim/ui%.lua$') then
+  if utils.is_default_select() then
     warn(
       'vim.ui.select: using default implementation, which may not provide the best user experience. See `:h CopilotChat-integration-with-pickers`.'
     )
   else
-    ok('vim.ui.select: overridden by `' .. select_source .. '`')
+    ok('vim.ui.select: overridden by `' .. debug.getinfo(vim.ui.select, 'S').source .. '`')
   end
 
   if lualib_installed('tiktoken_core') then
@@ -177,3 +178,4 @@ function M.check()
 end
 
 return M
+

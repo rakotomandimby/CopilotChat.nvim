@@ -43,22 +43,30 @@
 ---@field annotations CopilotChat.client.ResourceAnnotations?
 
 ---@class CopilotChat.client.Model
+--- identity
 ---@field provider string?
 ---@field id string
----@field request_model string?
+---@field request_model string? model id sent to the API (without effort or provider suffix)
 ---@field name string
+--- limits
 ---@field tokenizer string?
 ---@field max_input_tokens number?
 ---@field max_output_tokens number?
+--- capabilities
 ---@field streaming boolean?
 ---@field tools boolean?
+--- reasoning
 ---@field reasoning boolean?
 ---@field reasoning_efforts string[]?
 ---@field reasoning_effort string?
 ---@field reasoning_effort_index integer?
----@field input_credits number? AI Credits per million input tokens
----@field output_credits number? AI Credits per million output tokens
----@field picker boolean?
+--- pricing
+---@field input_credits number? AI Credits per 1M input tokens, nil when unknown
+---@field output_credits number? AI Credits per 1M output tokens, nil when unknown
+--- routing
+---@field picker boolean? false when the model cannot be called directly
+---@field use_responses boolean? true when the model is served by the Responses API
+---@field base_url string? API base URL used to reach the model
 
 local log = require('plenary.log')
 local constants = require('CopilotChat.constants')
@@ -169,6 +177,37 @@ local function generate_ask_request(system_prompt, history, generated_messages)
   vim.list_extend(messages, generated_messages)
   vim.list_extend(messages, history)
   return messages
+end
+
+--- Resolve a `<model_id>:<effort>` identifier against the known models.
+--- The longest known base model id wins, so ids that contain colons keep working.
+---@param models table<string, CopilotChat.client.Model>
+---@param model_id string
+---@return CopilotChat.client.Model? config Copy of the base model with the effort applied
+local function resolve_effort_variant(models, model_id)
+  local best, best_len, best_effort = nil, 0, nil
+
+  for id, cfg in pairs(models) do
+    if not cfg.reasoning_effort then
+      local prefix = id .. ':'
+      if vim.startswith(model_id, prefix) then
+        local effort = model_id:sub(#prefix + 1)
+        if effort ~= '' and #id > best_len then
+          best, best_len, best_effort = cfg, #id, effort
+        end
+      end
+    end
+  end
+
+  if not best then
+    return nil
+  end
+
+  local config = vim.deepcopy(best)
+  config.id = model_id
+  config.request_model = best.request_model or best.id
+  config.reasoning_effort = best_effort
+  return config
 end
 
 ---@class CopilotChat.client.Client : Class
@@ -312,37 +351,7 @@ function Client:ask(opts)
   log.debug('History:', #opts.history)
 
   local models = self:models()
-  local model_config = models[opts.model]
-  local reasoning_effort = nil
-
-  if not model_config then
-    -- Check if opts.model is in the format <model_id>:<effort>
-    local best_match = nil
-    local best_len = 0
-    local matched_effort = nil
-
-    for id, cfg in pairs(models) do
-      if not cfg.reasoning_effort then
-        local prefix = id .. ':'
-        if vim.startswith(opts.model, prefix) then
-          local effort = opts.model:sub(#prefix + 1)
-          if effort ~= '' and #id > best_len then
-            best_match = cfg
-            best_len = #id
-            matched_effort = effort
-          end
-        end
-      end
-    end
-
-    if best_match then
-      model_config = vim.deepcopy(best_match)
-      model_config.id = opts.model
-      model_config.request_model = best_match.request_model or best_match.id
-      model_config.reasoning_effort = matched_effort
-      reasoning_effort = matched_effort
-    end
-  end
+  local model_config = models[opts.model] or resolve_effort_variant(models, opts.model)
 
   if not model_config then
     error('Model not found: ' .. opts.model)
@@ -368,8 +377,7 @@ function Client:ask(opts)
         cfg.provider == provider_name
         and cfg.picker ~= false
         and not cfg.reasoning_effort
-        and id ~= 'auto'
-        and not id:match('^auto:')
+        and not utils.is_auto_model(id)
       then
         fallback = id
         break
@@ -390,7 +398,7 @@ function Client:ask(opts)
     end
   end
 
-  reasoning_effort = model_config.reasoning_effort
+  local reasoning_effort = model_config.reasoning_effort
   opts.model = model_config.request_model or opts.model:gsub(':' .. vim.pesc(provider_name) .. '$', '')
 
   if opts.model == 'auto' then
@@ -737,3 +745,4 @@ end
 
 --- @type CopilotChat.client.Client
 return Client()
+

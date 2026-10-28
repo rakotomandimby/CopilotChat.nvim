@@ -7,6 +7,9 @@ local curl = require('CopilotChat.utils.curl')
 local files = require('CopilotChat.utils.files')
 
 local EDITOR_VERSION = 'Neovim/' .. vim.version().major .. '.' .. vim.version().minor .. '.' .. vim.version().patch
+local DEFAULT_COPILOT_BASE_URL = 'https://api.githubcopilot.com'
+local MODELS_API_VERSION = '2026-08-01' -- token pricing requires the newer model-list API
+local CREDIT_TOKEN_UNIT = 1000000 -- rates are normalized to "credits per million tokens"
 
 local token_cache = nil
 local unsaved_token_cache = {}
@@ -209,7 +212,19 @@ local function resolve_copilot_base_url(token_body)
     -- Strip trailing slash if present
     return url:gsub('/$', '')
   end
-  return 'https://api.githubcopilot.com'
+  return DEFAULT_COPILOT_BASE_URL
+end
+
+--- Split the headers carried between provider calls into the routing base URL
+--- and the headers that are actually sent over the wire.
+---@param headers table<string, string>
+---@return string base_url
+---@return table<string, string> request_headers Shallow copy without the internal routing header
+local function split_copilot_headers(headers)
+  local base_url = headers['x-copilot-base-url'] or DEFAULT_COPILOT_BASE_URL
+  local request_headers = vim.tbl_extend('force', {}, headers)
+  request_headers['x-copilot-base-url'] = nil
+  return base_url, request_headers
 end
 
 --- Prepare input for Responses API
@@ -546,57 +561,77 @@ end
 ---@field prepare_output nil|fun(output:table, opts:CopilotChat.config.providers.Options):CopilotChat.config.providers.Output
 ---@field get_url nil|fun(opts:CopilotChat.config.providers.Options):string
 
-local function model_credit_rates(model)
-  local billing = model.billing
-  if billing == nil or billing == vim.NIL then
-    return nil, nil
+--- Return a pricing sub-table, or nil when it is missing or malformed.
+--- Malformed (non-table) values are reported once.
+---@param value any
+---@param label string Human readable name used in the warning
+---@param model_id string
+---@return table?
+local function pricing_table(value, label, model_id)
+  if utils.is_missing(value) then
+    return nil
   end
-  if type(billing) ~= 'table' then
-    log.warn('Invalid billing metadata for model ' .. model.id)
-    return nil, nil
+  if type(value) ~= 'table' then
+    log.warn('Invalid ' .. label .. ' for model ' .. model_id)
+    return nil
   end
+  return value
+end
 
-  local prices = billing.token_prices
-  if prices == nil or prices == vim.NIL then
-    return nil, nil
-  end
-  if type(prices) ~= 'table' then
-    log.warn('Invalid token pricing for model ' .. model.id)
-    return nil, nil
-  end
-
-  local default = prices.default
-  if default == nil or default == vim.NIL then
-    return nil, nil
-  end
-  if type(default) ~= 'table' then
-    log.warn('Invalid default token pricing for model ' .. model.id)
+--- Extract the default AI Credit rates of a model from its billing metadata.
+--- Rates are expressed in AI Credits per million tokens. Never throws:
+--- malformed metadata is logged and reported as unknown (nil).
+---@param model table Raw model entry of the `/models` response
+---@return number? input_credits AI Credits per 1M input tokens
+---@return number? output_credits AI Credits per 1M output tokens
+local function parse_credit_rates(model)
+  local billing = pricing_table(model.billing, 'billing metadata', model.id)
+  local prices = billing and pricing_table(billing.token_prices, 'token pricing', model.id)
+  local default = prices and pricing_table(prices.default, 'default token pricing', model.id)
+  if not default then
     return nil, nil
   end
 
   local batch_size = prices.batch_size
-  if type(batch_size) ~= 'number' or batch_size <= 0 or batch_size >= math.huge or batch_size ~= batch_size then
+  if not (utils.is_rate(batch_size) and batch_size > 0) then
     log.warn('Invalid token pricing batch size for model ' .. model.id)
     return nil, nil
   end
 
-  local function rate(value, name)
-    if value == nil or value == vim.NIL then
+  local function normalize(value, name)
+    if utils.is_missing(value) then
       return nil
     end
-    if type(value) ~= 'number' or value < 0 or value >= math.huge or value ~= value then
+    if not utils.is_rate(value) then
       log.warn('Invalid ' .. name .. ' token price for model ' .. model.id)
       return nil
     end
-    local normalized = value * (1000000 / batch_size)
-    if normalized >= math.huge or normalized ~= normalized then
+    local normalized = value * CREDIT_TOKEN_UNIT / batch_size
+    if not utils.is_rate(normalized) then
       log.warn('Invalid normalized ' .. name .. ' token price for model ' .. model.id)
       return nil
     end
     return normalized
   end
 
-  return rate(default.input_price, 'input'), rate(default.output_price, 'output')
+  return normalize(default.input_price, 'input'), normalize(default.output_price, 'output')
+end
+
+--- Collect the distinct, non-empty string reasoning efforts in their original order.
+---@param list any
+---@return string[]
+local function unique_efforts(list)
+  local out = {}
+  if type(list) ~= 'table' then
+    return out
+  end
+
+  for _, effort in ipairs(list) do
+    if type(effort) == 'string' and effort ~= '' and not vim.tbl_contains(out, effort) then
+      table.insert(out, effort)
+    end
+  end
+  return out
 end
 
 ---@type table<string, CopilotChat.config.providers.Provider>
@@ -683,18 +718,11 @@ M.copilot = {
   end,
 
   get_models = function(headers)
-    -- Use the resolved base URL carried in the custom header, falling back to
-    -- the default if it is absent (e.g. during tests or manual calls).
-    local base_url = headers['x-copilot-base-url'] or 'https://api.githubcopilot.com'
+    local base_url, request_headers = split_copilot_headers(headers)
 
-    -- Build request headers without our internal routing header.
-    local request_headers = vim.tbl_extend('force', {}, headers)
-    request_headers['x-copilot-base-url'] = nil
-
-    -- Token pricing requires the newer model-list API version.
     local response, err = curl.get(base_url .. '/models', {
       json_response = true,
-      headers = vim.tbl_extend('force', request_headers, { ['x-github-api-version'] = '2026-08-01' }),
+      headers = vim.tbl_extend('force', request_headers, { ['x-github-api-version'] = MODELS_API_VERSION }),
     })
 
     if err then
@@ -708,38 +736,38 @@ M.copilot = {
     local models = vim
       .iter(chat_models)
       :map(function(model)
-        local supported_endpoints = model.supported_endpoints or {}
-        local use_responses = vim.tbl_contains(supported_endpoints, '/responses')
         local supports = model.capabilities.supports or {}
         local limits = model.capabilities.limits or {}
-        local reasoning_efforts = {}
-        local input_credits, output_credits = model_credit_rates(model)
-
-        if type(supports.reasoning_effort) == 'table' then
-          for _, effort in ipairs(supports.reasoning_effort) do
-            if type(effort) == 'string' and effort ~= '' and not vim.tbl_contains(reasoning_efforts, effort) then
-              table.insert(reasoning_efforts, effort)
-            end
-          end
-        end
+        local supported_endpoints = model.supported_endpoints or {}
+        local reasoning_efforts = unique_efforts(supports.reasoning_effort)
+        local input_credits, output_credits = parse_credit_rates(model)
 
         return {
+          -- identity
           id = model.id,
           request_model = model.id,
           name = model.name,
+          version = model.version,
+
+          -- limits
           tokenizer = model.capabilities.tokenizer,
           max_input_tokens = limits.max_prompt_tokens,
           max_output_tokens = limits.max_output_tokens,
+
+          -- capabilities
           streaming = supports.streaming,
           tools = supports.tool_calls,
           reasoning = #reasoning_efforts > 0 or supports.adaptive_thinking or supports.max_thinking_budget ~= nil,
           reasoning_efforts = reasoning_efforts,
-          policy = not model['policy'] or model['policy']['state'] == 'enabled',
-          version = model.version,
+
+          -- pricing
           input_credits = input_credits,
           output_credits = output_credits,
-          use_responses = use_responses,
-          picker = not not model.model_picker_enabled,
+
+          -- routing
+          policy = not model['policy'] or model['policy']['state'] == 'enabled',
+          picker = model.model_picker_enabled == true,
+          use_responses = vim.tbl_contains(supported_endpoints, '/responses'),
           base_url = base_url,
         }
       end)
@@ -806,9 +834,7 @@ M.copilot = {
       return model
     end
 
-    local base_url = headers['x-copilot-base-url'] or 'https://api.githubcopilot.com'
-    local request_headers = vim.tbl_extend('force', {}, headers)
-    request_headers['x-copilot-base-url'] = nil
+    local base_url, request_headers = split_copilot_headers(headers)
 
     local url = base_url .. '/models/session'
     local response, err = curl.post(url, {
@@ -864,7 +890,7 @@ M.copilot = {
   get_url = function(opts)
     -- Use the base URL stored on the model (populated by get_models), falling
     -- back to the default for backwards compatibility.
-    local base_url = (opts and opts.model and opts.model.base_url) or 'https://api.githubcopilot.com'
+    local base_url = (opts and opts.model and opts.model.base_url) or DEFAULT_COPILOT_BASE_URL
 
     if opts and opts.model and opts.model.use_responses then
       return base_url .. '/responses'
@@ -919,3 +945,4 @@ M.github_models = {
 }
 
 return M
+
