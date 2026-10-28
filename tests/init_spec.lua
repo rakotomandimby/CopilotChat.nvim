@@ -18,19 +18,74 @@ describe('CopilotChat model picker pricing', function()
   local client = require('CopilotChat.client')
   local curl = require('CopilotChat.utils.curl')
   local log = require('plenary.log')
-  local original_models, original_select, original_input, original_echo, original_warn, original_model, original_auth
-  local original_post
+
+  local restores = {}
+
+  --- Replace `tbl[key]` for the duration of a test, the original is restored in `after_each`.
+  local function patch(tbl, key, value)
+    local original = tbl[key]
+    table.insert(restores, function()
+      tbl[key] = original
+    end)
+    tbl[key] = value
+  end
+
+  --- Collect the warnings logged from now on.
+  local function capture_warnings()
+    local warnings = {}
+    patch(log, 'warn', function(message)
+      table.insert(warnings, message)
+    end)
+    return warnings
+  end
+
+  --- Stub `vim.ui.select` and record what the picker renders.
+  ---@return { choices: table[]?, labels: table<string, string>, choose: fun(item: table?)? }
+  local function capture_select()
+    local state = { labels = {} }
+    patch(vim.ui, 'select', function(items, opts, callback)
+      state.choices, state.choose = items, callback
+      for _, item in ipairs(items) do
+        state.labels[item.id] = opts.format_item(item)
+      end
+    end)
+    return state
+  end
+
+  --- Select the choice with the given id, like a user would in a custom picker.
+  local function choose_id(state, id)
+    for _, item in ipairs(state.choices) do
+      if item.id == id then
+        state.choose(item)
+        return
+      end
+    end
+    error('No choice with id ' .. id)
+  end
+
+  --- Stub the built-in `vim.ui.select` (inputlist based) together with its echo and input prompts.
+  local function use_builtin_picker()
+    local state = {}
+    patch(vim.ui, 'select', assert(loadstring('return function() end', '@/test/vim/ui.lua'))())
+    patch(vim.api, 'nvim_echo', function(chunks)
+      state.text = chunks[1][1]
+    end)
+    patch(vim.ui, 'input', function(_, callback)
+      state.on_input = callback
+    end)
+
+    return {
+      displayed = function()
+        return state.text
+      end,
+      input = function(code)
+        state.on_input(code)
+      end,
+    }
+  end
 
   before_each(function()
-    original_models = client.models
-    original_select = vim.ui.select
-    original_input = vim.ui.input
-    original_echo = vim.api.nvim_echo
-    original_warn = log.warn
-    original_model = chat.config.model
-    original_auth = client.authenticate
-    original_post = curl.post
-    client.models = function()
+    patch(client, 'models', function()
       return {
         auto = { id = 'auto', name = 'Auto (Copilot)', provider = 'copilot' },
         cheap = { id = 'cheap', name = 'Cheap', provider = 'z', output_credits = 0 },
@@ -78,33 +133,20 @@ describe('CopilotChat model picker pricing', function()
         zpartial = { id = 'zpartial', name = 'Missing output', provider = 'other', input_credits = 10 },
         invalid = { id = 'invalid', name = 'Invalid', provider = 'other', input_credits = 'bad', output_credits = -1 },
       }
-    end
-    chat.config.model = 'priced'
+    end)
+    patch(chat.config, 'model', 'priced')
   end)
 
   after_each(function()
-    client.models = original_models
-    vim.ui.select = original_select
-    vim.ui.input = original_input
-    vim.api.nvim_echo = original_echo
-    log.warn = original_warn
-    chat.config.model = original_model
-    client.authenticate = original_auth
-    curl.post = original_post
+    for i = #restores, 1, -1 do
+      restores[i]()
+    end
+    restores = {}
   end)
 
   it('renders rates in a custom picker and preserves selection and cancellation', function()
-    local labels, choose, choices = {}, nil, nil
-    local warnings = {}
-    log.warn = function(message)
-      table.insert(warnings, message)
-    end
-    vim.ui.select = function(items, opts, callback)
-      choices, choose = items, callback
-      for _, item in ipairs(items) do
-        labels[item.id] = opts.format_item(item)
-      end
-    end
+    local warnings = capture_warnings()
+    local state = capture_select()
 
     chat.select_model()
 
@@ -124,8 +166,9 @@ describe('CopilotChat model picker pricing', function()
       },
       vim.tbl_map(function(item)
         return item.id
-      end, choices)
+      end, state.choices)
     )
+    local labels = state.labels
     assert.equals('1. Auto (Copilot) [?/?, copilot]', labels.auto)
     assert.equals('2. Cheap [?/0, z]', labels.cheap)
     assert.equals('3. Partial [0/0.125, other]', labels.partial)
@@ -138,48 +181,40 @@ describe('CopilotChat model picker pricing', function()
     assert.equals('7. Invalid [?/?, other]', labels.invalid)
     assert.equals('8. Missing output [10/?, other]', labels.zpartial)
     assert.equals(2, #warnings)
-    choose(nil)
+
+    state.choose(nil)
     assert.equals('priced', chat.config.model)
-    for _, item in ipairs(choices) do
-      if item.id == 'priced:high' then
-        choose(item)
-      end
-    end
+    choose_id(state, 'priced:high')
     assert.equals('priced:high', chat.config.model)
+
     chat.select_model()
-    assert.equals('    * 4b. High', labels['priced:high'])
+    assert.equals('    * 4b. High', state.labels['priced:high'])
   end)
 
   it('renders rates in the built-in picker and selects an effort code', function()
-    local displayed, on_input
-    vim.ui.select = assert(loadstring('return function() end', '@/test/vim/ui.lua'))()
-    vim.api.nvim_echo = function(chunks)
-      displayed = chunks[1][1]
-    end
-    vim.ui.input = function(_, callback)
-      on_input = callback
-    end
-    log.warn = function() end
+    local picker = use_builtin_picker()
+    capture_warnings()
 
     chat.select_model()
 
+    local displayed = picker.displayed()
     assert.truthy(displayed:find('1. Auto (Copilot) [?/?, copilot]', 1, true))
     assert.truthy(displayed:find('Priced %[100/500, copilot, streaming, tools%]'))
     assert.truthy(displayed:find('4a. Low - 4b. High', 1, true))
     assert.truthy(displayed:find('5a. High', 1, true))
     assert.truthy(displayed:find('Partial %[0/0%.125, other%]'))
     assert.truthy(displayed:find('Missing output %[10/%?, other%]'))
-    on_input('')
+    picker.input('')
     assert.equals('priced', chat.config.model)
-    on_input('4b')
+    picker.input('4b')
     assert.equals('priced:high', chat.config.model)
     chat.select_model()
-    assert.truthy(displayed:find('4a. Low - *4b. High', 1, true))
-    on_input('5a')
+    assert.truthy(picker.displayed():find('4a. Low - *4b. High', 1, true))
+    picker.input('5a')
     assert.equals('sibling:high', chat.config.model)
-    on_input('2')
+    picker.input('2')
     assert.equals('cheap', chat.config.model)
-    on_input('1')
+    picker.input('1')
     assert.equals('auto', chat.config.model)
   end)
 
@@ -198,35 +233,29 @@ describe('CopilotChat model picker pricing', function()
       reasoning_effort_index = 1,
       output_credits = 999,
     }
-    client.models = function()
+    patch(client, 'models', function()
       return models
-    end
-    local displayed, on_input
-    vim.ui.select = assert(loadstring('return function() end', '@/test/vim/ui.lua'))()
-    vim.api.nvim_echo = function(chunks)
-      displayed = chunks[1][1]
-    end
-    vim.ui.input = function(_, callback)
-      on_input = callback
-    end
+    end)
+    local picker = use_builtin_picker()
 
     chat.select_model()
 
+    local displayed = picker.displayed()
     local ten = assert(displayed:find('10. model-04', 1, true))
     local eleven = assert(displayed:find('11. model-03', 1, true))
     assert.is_true(ten < eleven)
     assert.truthy(displayed:find('10a. High', 1, true))
-    on_input('10a')
+    picker.input('10a')
     assert.equals('model-04:high', chat.config.model)
 
     local request
-    client.authenticate = function()
+    patch(client, 'authenticate', function()
       return {}
-    end
-    curl.post = function(_, opts)
+    end)
+    patch(curl, 'post', function(_, opts)
       request = opts.body
       return { body = vim.json.encode({ choices = { { message = { content = 'ok' }, finish_reason = 'stop' } } }) }
-    end
+    end)
     local function send_selected()
       client:ask({
         headless = true,
@@ -241,14 +270,14 @@ describe('CopilotChat model picker pricing', function()
     assert.equals('model-04', request.model)
     assert.equals('high', request.reasoning_effort)
 
-    on_input('10')
+    picker.input('10')
     assert.equals('model-04', chat.config.model)
     send_selected()
     assert.equals('model-04', request.model)
     assert.is_nil(request.reasoning_effort)
-    on_input('11')
+    picker.input('11')
     assert.equals('model-03', chat.config.model)
-    on_input('1')
+    picker.input('1')
     assert.equals('auto', chat.config.model)
   end)
 
@@ -258,29 +287,26 @@ describe('CopilotChat model picker pricing', function()
       ['auto:other'] = { id = 'auto:other', name = 'Other Auto', provider = 'other', output_credits = 1 },
       cheap = { id = 'cheap', name = 'Cheap', provider = 'copilot', output_credits = 0 },
     }
-    client.models = function()
+    patch(client, 'models', function()
       return models
-    end
-    local choices, choose
-    vim.ui.select = function(items, _, callback)
-      choices, choose = items, callback
-    end
+    end)
+    local state = capture_select()
 
     chat.select_model()
-    assert.equals('auto', choices[1].id)
-    assert.equals('auto:other', choices[2].id)
-    assert.equals('cheap', choices[3].id)
-    choose(choices[2])
+    assert.equals('auto', state.choices[1].id)
+    assert.equals('auto:other', state.choices[2].id)
+    assert.equals('cheap', state.choices[3].id)
+    state.choose(state.choices[2])
     assert.equals('auto:other', chat.config.model)
 
     models.auto = nil
     chat.select_model()
-    assert.equals('auto:other', choices[1].id)
-    assert.equals('cheap', choices[2].id)
+    assert.equals('auto:other', state.choices[1].id)
+    assert.equals('cheap', state.choices[2].id)
   end)
 
   it('keeps codes unique for duplicate effort indexes and standalone variants', function()
-    client.models = function()
+    patch(client, 'models', function()
       return {
         model = { id = 'model', name = 'Model', provider = 'copilot', output_credits = 10 },
         ['model:low'] = {
@@ -310,28 +336,20 @@ describe('CopilotChat model picker pricing', function()
           output_credits = 15,
         },
       }
-    end
-    local labels, choose, choices = {}, nil, nil
-    local warnings = {}
-    log.warn = function(message)
-      table.insert(warnings, message)
-    end
-    vim.ui.select = function(items, opts, callback)
-      choices, choose = items, callback
-      for _, item in ipairs(items) do
-        labels[item.id] = opts.format_item(item)
-      end
-    end
+    end)
+    local warnings = capture_warnings()
+    local state = capture_select()
 
     chat.select_model()
 
-    assert.equals('      1a. Low', labels['model:low'])
-    assert.equals('      1b. Medium', labels['model:medium'])
-    assert.equals('2. Hidden (high) [?/15, copilot]', labels['hidden:high'])
+    assert.equals('      1a. Low', state.labels['model:low'])
+    assert.equals('      1b. Medium', state.labels['model:medium'])
+    assert.equals('2. Hidden (high) [?/15, copilot]', state.labels['hidden:high'])
     assert.equals(1, #warnings)
-    for _, item in ipairs(choices) do
-      choose(item)
+    for _, item in ipairs(state.choices) do
+      state.choose(item)
       assert.equals(item.id, chat.config.model)
     end
   end)
 end)
+
