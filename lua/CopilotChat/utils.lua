@@ -276,4 +276,3 @@ function M.split_lines(text)
 end
 
 return M
-

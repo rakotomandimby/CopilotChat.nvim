@@ -352,4 +352,3 @@ describe('CopilotChat model picker pricing', function()
     end
   end)
 end)
-

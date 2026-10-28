@@ -63,4 +63,3 @@ describe('CopilotChat.utils', function()
     assert.is_false(utils.is_auto_model('gpt-5:auto'))
   end)
 end)
-

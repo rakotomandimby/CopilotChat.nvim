@@ -111,10 +111,9 @@ describe('CopilotChat copilot provider models', function()
   end)
 
   it('uses the newer API version without mutating the caller headers', function()
-    local disabled =
-      priced('disabled', { batch_size = 1000000, default = { input_price = 1, output_price = 1 } }, {
-        policy = { state = 'disabled' },
-      })
+    local disabled = priced('disabled', { batch_size = 1000000, default = { input_price = 1, output_price = 1 } }, {
+      policy = { state = 'disabled' },
+    })
 
     local captured_headers, policy_headers
     patch(curl, 'get', function(_, opts)
@@ -398,4 +397,3 @@ describe('CopilotChat copilot provider models', function()
     assert.equals('Hello', vim.trim(prompt))
   end)
 end)
-

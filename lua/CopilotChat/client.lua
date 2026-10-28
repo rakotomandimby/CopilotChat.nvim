@@ -745,4 +745,3 @@ end
 
 --- @type CopilotChat.client.Client
 return Client()
-
