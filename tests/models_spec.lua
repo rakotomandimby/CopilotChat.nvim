@@ -471,4 +471,3 @@ describe('CopilotChat copilot provider models', function()
     end)
   end)
 end)
-
